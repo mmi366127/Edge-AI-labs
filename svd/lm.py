@@ -1,17 +1,70 @@
 
 import json
 import argparse
-
+import click
 
 import torch
 import torch.nn as nn 
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils.text_data import get_calib_data
-from utils import set_seed
+from utils.sensitivity import calib_sensitivity_ppl
+from utils.eval import eval_ppl
+from utils import set_seed, rounding_result
+from models import AVAILABLE_MODELS
+from models.module import get_module_by_name
+
+
+
+
 
 def rank_search(model: nn.Module, args, calib_loader):
-    pass
+    click.secho(f"[Rank search] Do rank searching. Search method: {args.search_method}", fg="yellow")
+
+    if args.search_method == "STRS":
+        sensitivity = calib_sensitivity_ppl(model, calib_loader, args)
+
+        if args.only_search:
+            click.secho(f"[Rank search][Debug] Only search on {args.only_search}", fg="yellow")
+            # filter out the layers that are not in the only search list
+            layer_names = list(sensitivity.keys())
+            new_sensitivity = {}
+            for layer in layer_names:
+                # Only support the first layer type now
+                for layer_type in args.only_search:
+                    if layer_type in layer:
+                        new_sensitivity[layer] = sensitivity[layer]
+            sensitivity = new_sensitivity
+            click.secho(f"[Rank search][Debug] Only search on {[name for name in list(sensitivity.keys())]}", fg="yellow")
+
+
+        if args.search_method == "STRS":
+            from utils.binary_search import binary_search_truncation_rank
+            select_result = binary_search_truncation_rank(model, sensitivity, args)
+
+
+    
+
+    select_result = rounding_result(select_result)
+    total_params = 0
+    for param in model.parameters():
+        total_params += param.numel()
+    
+    compressed_params = 0
+    for layername, rank in select_result.items():
+        module = get_module_by_name(model, layername)
+        w = module.in_features
+        h = module.out_features 
+        compressed_params += h * w - (w * rank + h * rank)
+
+    return select_result, total_params, total_params - compressed_params
+
+
+
+
+
+
+
 
 def main(args):
     
@@ -34,16 +87,46 @@ def main(args):
     else:
 
         # get calibration data loader 
-        calib_loader = get_calib_data(args.calib_dataset, tokenizer, args.model_id, 2048, seqlen=args.calib_seqlen)
+        calib_loader = get_calib_data(args.calib_dataset, tokenizer, args.model_id, 2048, seqlen=args.calib_seqlen, seed=args.seed)
 
+        # insert information 
+        # if "fisher" in args.scaling_method or "fisher" in args.search_metric:
+        #     calib_fisher_info(model, calib_loader, torch.device(args.device), args.use_cache)
+        
         if "whiten" in args.scaling_method:
             from utils.whiten import get_whiten_scale_matrix
-            get_whiten_scale_matrix(model, calib_loader, args)
+            small_calib_loader = get_calib_data(args.calib_dataset, tokenizer, args.model_id, args.n_calib_samples, seqlen=args.calib_seqlen, seed=args.seed)
+            get_whiten_scale_matrix(model, small_calib_loader, args)
         
+        # asvd method
+        # if "abs" in args.scaling_method:
+        #     calib_input_distribution(model, calib_loader, args.scaling_method, torch.device(args.device), args.use_cache)
 
-        module_map, full_rank, rank_sum = rank_search(model, args, calib_loader)
+        select_result, original_params, params = rank_search(model, args, calib_loader)
     
+
+        click.secho(f"compress ratio = {params / original_params}", fg="green")
+
     
+    target_model_class = AVAILABLE_MODELS[model.config.model_type]["ModelForCausalLM"]
+    module_map = target_model_class.to_module_map(select_result)
+    model_lora = target_model_class.from_original(model, module_map)
+
+    # just delete the old model
+    del model
+
+    model_lora.half()
+    model_lora.to(torch.device(args.device))
+
+    res = {}
+
+    res_ppl = eval_ppl(model_lora, tokenizer, args.model_id, "wikitext2", device=args.device)
+    res.update(res_ppl)
+
+    res_ppl = eval_ppl(model_lora, tokenizer, args.model_id, "c4", device=args.device)
+    res.update(res_ppl)
+
+    print(res)
 
 
 
