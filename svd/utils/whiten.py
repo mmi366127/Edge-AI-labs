@@ -20,14 +20,13 @@ def find_layers(module, layers=[nn.Conv2d, nn.Linear], name=''):
 
 
 @torch.no_grad()
-def get_whiten_scale_matrix(model, calib_loader, args, dev):
-    model_id = model.config._name_or_path
-
+def get_whiten_scale_matrix_vision(model, calib_loader, args, dev=torch.device("cuda")):
     if not os.path.exists("cache/whiten"):
         os.makedirs("cache/whiten") 
     
-    cache_file = f"cache/whiten/{model_id.replace('/','_')}_{args.calib_dataset}_{args.n_calib_samples}_{args.calib_seqlen}_whiten_scaling_matrices_fp16.pt"
-    
+    model_id = args.model_id
+    cache_file = f"cache/whiten/{model_id.replace('/', '_')}_{args.calib_dataset}_{args.n_calib_samples}_whiten_scaling_matrices_fp16.pt"
+
     """
     cache format:
     [
@@ -40,6 +39,150 @@ def get_whiten_scale_matrix(model, calib_loader, args, dev):
             "mlp.up_proj": torch.Tensor,
             "mlp.down_proj": torch.Tensor
         },
+        ... (stacked n times, in the order of model layers)
+    ]
+    """
+
+    click.secho(f"[whiten] Calibration dataset: {args.calib_dataset}", fg="yellow")
+    click.secho(f"[whiten] Search cache_file={cache_file}", fg="yellow")
+
+    if os.path.exists(cache_file) and args.use_cache:
+        scaling_matrics = torch.load(cache_file, map_location="cpu")
+        
+        layers = model.blocks
+        for i in tqdm(range(len(layers))):
+            layer = layers[i]
+            subset = find_layers(layer) # Collect all linear layers
+            for name in subset:
+                if name in scaling_matrics[i]:
+                    scaling_diag_matrix = scaling_matrics[i][name]
+                    subset[name].scaling_diag_matrix = scaling_diag_matrix
+
+        return 
+    
+    click.secho(f"No cache_file={cache_file}", fg="red")
+    click.secho(f"Create whiten scale matrix dict...", fg="yellow")
+
+    layers = model.blocks
+    model.to(dev)
+
+    dtype = next(iter(model.parameters())).dtype
+    click.secho(f"data type: {dtype}", fg="green")
+
+    inps = []
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+        
+        def forward(self, inp, **kwargs):
+            inps.append(inp)
+            raise ValueError
+
+    layers[0] = Catcher(layers[0])
+    for image, target in calib_loader:
+        try:
+            model(image.to(dev))
+        
+        except ValueError:
+            pass
+    
+    layers[0] = layers[0].module
+    torch.cuda.empty_cache()
+    scaling_matrices = []
+    for i in tqdm(range(len(layers))):
+        layer = layers[i]
+        subset = find_layers(layer)
+        def hook(module, input, output):
+            inp = input[0].detach().float()
+            if inp.dim() == 2:
+                inp = inp.unsqueeze(0)
+            adds = torch.matmul(inp.transpose(1,2), inp)
+            adds_sum = torch.sum(adds, dim=0)
+            module.scaling_diag_matrix += adds_sum
+            del inp, adds, adds_sum, output
+            torch.cuda.empty_cache()
+        
+        handles = []
+        for name in subset:
+            subset[name].scaling_diag_matrix = 0
+            handles.append(subset[name].register_forward_hook(hook))
+        outs = []
+        for j in range(len(inps)):
+            outs.append(layer(inps[j]))
+        for h in handles:
+            h.remove()
+        layer = layer.cpu()
+        for name in subset:
+            subset[name].scaling_diag_matrix = subset[name].scaling_diag_matrix.cpu()
+        torch.cuda.empty_cache()
+        layer_scaling_matrices = {}
+        for name in subset:
+            W = subset[name].weight.data.float().cuda()
+            raw_scaling_diag_matrix = subset[name].scaling_diag_matrix.double().cuda()
+            try:
+                scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix).float()
+            except Exception as e:
+                print("Warning: eigen scaling_diag_matrix is not positive!")
+                if torch.isnan(raw_scaling_diag_matrix).any():
+                    print("Warning: raw scaling_diag_matrix contains NaN!")
+                elif torch.isinf(raw_scaling_diag_matrix).any():
+                    print("Warning: raw scaling_diag_matrix contains Inf!")
+                if not torch.equal(raw_scaling_diag_matrix, raw_scaling_diag_matrix.T):
+                    print("Warning: raw scaling_diag_matrix is not a symmetric matrix!")
+                eigenvalues = torch.linalg.eigvalsh(raw_scaling_diag_matrix)
+                raw_scaling_diag_matrix += (- eigenvalues[0] + 1e-3) * torch.eye(raw_scaling_diag_matrix.shape[0]).cuda()
+                scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix).float()
+                if torch.isnan(scaling_diag_matrix).any():
+                    print("Warning: scaling_diag_matrix contains NaN!")
+                elif torch.isinf(scaling_diag_matrix).any():
+                    print("Warning: scaling_diag_matrix contains Inf!")
+                del eigenvalues
+            try:
+                scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
+            except Exception as e:
+                print("Warning: scaling_diag_matrix is not full rank!")
+                reg_inv =  1e-3 * torch.eye(scaling_diag_matrix.shape[0]).cuda() 
+                scaling_diag_matrix += reg_inv
+                scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
+                del reg_inv
+            layer_scaling_matrices[name] = scaling_diag_matrix.to(torch.float16).cpu()
+            torch.cuda.empty_cache()
+        scaling_matrices.append(layer_scaling_matrices)
+        layers[i] = layer.cpu()
+        inps = outs
+        torch.cuda.empty_cache()
+
+        torch.save(scaling_matrices, cache_file)
+        click.secho(f"Save the whiten scale matrix dict to:  {cache_file}", fg="yellow")
+
+
+
+
+
+
+
+
+
+@torch.no_grad()
+def get_whiten_scale_matrix(model, calib_loader, args, dev=torch.device("cuda")):
+    if hasattr(model, "config"):
+        model_id = model.config._name_or_path
+    else:
+        return get_whiten_scale_matrix_vision(model, calib_loader, args, dev)
+
+
+    if not os.path.exists("cache/whiten"):
+        os.makedirs("cache/whiten") 
+    
+    cache_file = f"cache/whiten/{model_id.replace('/','_')}_{args.calib_dataset}_{args.n_calib_samples}_{args.calib_seqlen}_whiten_scaling_matrices_fp16.pt"
+    
+    """
+    cache format:
+    [
+        {
+            layername: torch.Tensor,
+        }    
         ... (stacked n times, in the order of model layers)
     ]
     """

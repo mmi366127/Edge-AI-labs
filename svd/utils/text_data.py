@@ -16,22 +16,20 @@ import torch.nn as nn
 
 
 
-
 # Wrapper for tokenized input IDs
 class TokenizerWrapper:
     def __init__(self, input_ids):
         self.input_ids = input_ids
 
 
-
-def get_calib_data(name, tokenizer, model_id, nsamples, seqlen=2048, seed=3):
+def get_calib_data(name, tokenizer, model_id, nsamples, seqlen=2048, batch_size=1, seed=3):
     click.secho(f" get_ptq_calib_data {name}, nsamples={nsamples}, seqlen={seqlen}, {seed}", fg="green")
     cache_file = (
         f"cache/dataset/{name}_{model_id.replace('/','_')}_calib_{nsamples}_{seqlen}_{seed}.pt"
     )
     random.seed(seed)
-    if not os.path.exists("cache"):
-        os.makedirs("cache")
+    if not os.path.exists("cache/dataset"):
+        os.makedirs("cache/dataset")
     if os.path.exists(cache_file):
         traindataset = torch.load(cache_file)
         click.secho(f"[Calib data] Load from {cache_file}", fg="yellow")
@@ -49,15 +47,25 @@ def get_calib_data(name, tokenizer, model_id, nsamples, seqlen=2048, seed=3):
         tot_text = "\n\n".join(traindata["text"])
     else:
         raise NotImplementedError
+    
+    nsamples += 1
+    
     click.secho(f"tot_text={len(tot_text)}", fg="green")
     traindataset = []
-    for _ in range(nsamples):
+    for s in range(nsamples):
         i = random.randint(0, len(tot_text) - seqlen - 1)
         j = i + seqlen * 10
         trainenc = tokenizer(tot_text[i:j], return_tensors="pt")
-        inp = trainenc.input_ids[:, :seqlen]
-        attention_mask = torch.ones_like(inp)
-        traindataset.append({"input_ids": inp, "attention_mask": attention_mask})
+        if trainenc.input_ids.shape[1] < seqlen:
+            s = s - 1
+            continue
+        if s % batch_size == 0:
+            if s != 0:
+                attention_mask = torch.ones_like(inp)
+                traindataset.append({"input_ids": inp, "attention_mask": attention_mask})
+            inp = trainenc.input_ids[:, :seqlen]
+        else:
+            inp = torch.cat((inp, trainenc.input_ids[:, :seqlen]), dim=0)
     torch.save(traindataset, cache_file)
     return traindataset
 

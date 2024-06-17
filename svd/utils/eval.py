@@ -12,6 +12,7 @@ from .text_data import get_eval_loaders
 
 @torch.no_grad()
 def evaluate_perplexity(model, dataset, limit):
+    # for creating sensitivity list
     """
     dataset: input ids tensor of shape [batch, sequence length]
     """
@@ -88,3 +89,39 @@ def eval_ppl(model, tokenizer, model_name, datasets, seqlen=2048, device="cuda")
         results.update({dataset: ppl.item()})
 
     return results
+
+
+
+@torch.no_grad()
+def eval_accuracy(model, dataset, dev=torch.device("cuda")):
+
+    model.to(dev)
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for  images, labels in dataset:
+            images, labels = images.to(dev), labels.to(dev)
+            outputs = model(images)
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    accuracy = 100 * correct / total
+    return accuracy
+
+
+@torch.no_grad()
+def eval_loss(model, dataset, dev=torch.device("cuda")):
+
+    model.to(dev)
+    loss_fn = nn.CrossEntropyLoss()
+    total_loss = 0
+    total_cnt = 0
+    with torch.no_grad():
+        for  images, labels in dataset:
+            images, labels = images.to(dev), labels.to(dev)
+            outputs = model(images)
+            total_loss += loss_fn(outputs, labels)
+            total_cnt += labels.size(0)
+    
+    return (total_loss / total_cnt).item()

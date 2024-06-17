@@ -8,10 +8,11 @@ from tqdm import tqdm
 from torchvision import datasets, transforms
 from timm.data import create_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.data import create_transform
 from torch.utils.data import DataLoader
 import numpy as np
 import torch
+
+
 
 
 def data_loader_to_list(data_loader, num_batches):
@@ -98,3 +99,15 @@ def getMiniTestDataset():
     for images in class_images:
         mini_test_dataset.extend(images)
     return mini_test_dataset
+
+
+def get_calib_data(name, nsamples, batch_size=32, seed=42):
+    from . import set_seed
+    set_seed(seed)
+    if name == "cifar100":
+        train_set, nb_classes = build_dataset_CIFAR100(is_train=True, data_path='./data')
+        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, drop_last=True)
+        return data_loader_to_list(train_loader, nsamples // batch_size)
+
+    else:
+        raise NotImplementedError
